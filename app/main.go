@@ -32,14 +32,30 @@ type Manifest struct {
 // Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
 func main() {
 	image := os.Args[2]
-
 	command := os.Args[3]
 	args := os.Args[4:len(os.Args)]
 
-	chrootDir := os.TempDir()
+	chrootDir, err := os.MkdirTemp("", "")
+
+	token, err := getBearerToken(image)
+	if err != nil {
+		fmt.Printf("error getting token: %v", err)
+		os.Exit(1)
+	}
+
+	manifest, err := fetchManifest(token, image)
+	if err != nil {
+		fmt.Printf("error fetching manifest: %v", err)
+		os.Exit(1)
+	}
+
+	if err := extractImage(chrootDir, token, image, manifest); err != nil {
+		fmt.Printf("error extracting image: %v", err)
+		os.Exit(1)
+	}
 
 	if err := copyExecutableIntoDir(chrootDir, command); err != nil {
-		fmt.Printf("copy executable err: %v", err)
+		fmt.Printf("error copy executable: %v", err)
 		os.Exit(1)
 	}
 
@@ -53,31 +69,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	token, err := getBearerToken(image)
-	if err != nil {
-		fmt.Printf("Auth err: %v", err)
-		os.Exit(1)
-	}
-
-	manifest, err := fetchManifest(token, image)
-	if err != nil {
-		fmt.Printf("error fetching manifest: %v", err)
-		os.Exit(1)
-	}
-
-	err = extractImage(chrootDir, token, image, manifest)
-	if err != nil {
-		fmt.Printf("error extracting image: %v", err)
-		os.Exit(1)
-	}
-
 	cmd := exec.Command(command, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID,
 	}
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
 	err = cmd.Run()
 	if exitError, ok := err.(*exec.ExitError); ok {
@@ -92,7 +89,7 @@ func main() {
 func copyExecutableIntoDir(chrootDir string, executablePath string) error {
 	executablePathInChrootDir := path.Join(chrootDir, executablePath)
 
-	if err := os.MkdirAll(path.Dir(executablePathInChrootDir), 0750); err != nil {
+	if err := os.MkdirAll(path.Dir(executablePathInChrootDir), os.ModeDir); err != nil {
 		return err
 	}
 
@@ -110,6 +107,15 @@ func CopyFile(sourceFilePath string, destinationFilePath string) error {
 		return err
 	}
 	defer sourceFile.Close()
+
+	if _, err := os.Stat(destinationFilePath); err == nil {
+		err := os.Rename(destinationFilePath, destinationFilePath+".old")
+		if err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 
 	destinationFile, err := os.OpenFile(destinationFilePath, os.O_RDWR|os.O_CREATE, sourceFileStat.Mode())
 	if err != nil {
@@ -158,7 +164,7 @@ func fetchManifest(token, repo string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read http response body: %w", err)
 	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer  %s", token))
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", token))
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read http response body: %w", err)
@@ -171,26 +177,28 @@ func fetchManifest(token, repo string) (*Manifest, error) {
 	}
 
 	var manifest Manifest
-	return &manifest, json.Unmarshal(body, &manifest)
+	err = json.Unmarshal(body, &manifest)
+	return &manifest, err
 }
 
 func extractImage(dest, token, repo string, manifest *Manifest) error {
-	for index, blobSum := range manifest.FsLayers {
-		if err := fetchLayer(dest, token, repo, blobSum, index); err != nil {
+	for _, fsLayer := range manifest.FsLayers {
+		if err := fetchLayer(dest, token, repo, fsLayer); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func fetchLayer(dest, token, repo string, fsLayer FsLayer, index int) error {
+func fetchLayer(dest, token, repo string, fsLayer FsLayer) error {
+	var res *http.Response
 	url := fmt.Sprintf("https://registry-1.docker.io/v2/library/%s/blobs/%s", repo, fsLayer.BlobSum)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to read http response body: %w", err)
 	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer  %s", token))
-	res, err := http.DefaultClient.Do(req)
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", token))
+	res, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to read http response body: %w", err)
 	}
